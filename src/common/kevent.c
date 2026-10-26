@@ -173,18 +173,30 @@ kevent_copyin_one(struct kqueue *kq, const struct kevent64_s *src)
     if ((src->flags & EV_DELETE) || ((kn->kn_flags & KNFL_DEFER_DELETE) && (src->flags & EV_ENABLE))) {
         rv = knote_delete(filt, kn);
         dbg_printf("knote_delete returned %d", rv);
-    } else if (src->flags & EV_DISABLE) {
-        kn->kev.flags |= EV_DISABLE;
-        rv = filt->kn_disable(filt, kn);
-        dbg_printf("kn_disable returned %d", rv);
-    } else if (src->flags & EV_ENABLE) {
-        kn->kev.flags &= ~EV_DISABLE;
-        rv = filt->kn_enable(filt, kn);
-        dbg_printf("kn_enable returned %d", rv);
     } else if (src->flags & EV_ADD || src->flags == 0 || src->flags & EV_RECEIPT) {
+        /* EV_ADD|EV_ENABLE is an update followed by an optional transition,
+         * not just EPOLL_CTL_ADD on an already enabled descriptor. */
+        int disabled = !!(kn->kev.flags & EV_DISABLE);
         kn->kev.udata = src->udata;
         rv = filt->kn_modify(filt, kn, src);
-        dbg_printf("kn_modify returned %d", rv);
+        if (rv == 0 && (src->flags & EV_DISABLE) && !disabled) {
+            rv = filt->kn_disable(filt, kn);
+            if (rv == 0) kn->kev.flags |= EV_DISABLE;
+        } else if (rv == 0 && (src->flags & EV_ENABLE) && disabled) {
+            rv = filt->kn_enable(filt, kn);
+            if (rv == 0) kn->kev.flags &= ~EV_DISABLE;
+        }
+        dbg_printf("kn_modify/update returned %d", rv);
+    } else if (src->flags & EV_DISABLE) {
+        if (!(kn->kev.flags & EV_DISABLE)) {
+            rv = filt->kn_disable(filt, kn);
+            if (rv == 0) kn->kev.flags |= EV_DISABLE;
+        }
+    } else if (src->flags & EV_ENABLE) {
+        if (kn->kev.flags & EV_DISABLE) {
+            rv = filt->kn_enable(filt, kn);
+            if (rv == 0) kn->kev.flags &= ~EV_DISABLE;
+        }
     }
 
     return (rv);
