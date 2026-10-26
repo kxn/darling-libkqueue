@@ -1,3 +1,9 @@
+#ifdef DARLING
+#include <darling-config.h>
+#define KQUEUE_PROCFS_PATH DARLING_PROCFS_PATH
+#else
+#define KQUEUE_PROCFS_PATH "/proc"
+#endif
 /*
  * Copyright (c) 2017 Lubos Dolezel
  *
@@ -59,7 +65,7 @@ evfilt_fs_knote_create(struct filter *filt, struct knote *kn)
     ev.events = kn->data.events;
     ev.data.ptr = kn;
 
-    kn->kdata.kn_dupfd = open("/proc/mounts", O_RDONLY);
+    kn->kdata.kn_dupfd = open(KQUEUE_PROCFS_PATH "/mounts", O_RDONLY);
 	if (kn->kdata.kn_dupfd == -1) {
         dbg_printf("open /proc/mounts: %s", strerror(errno));
         return (-1);

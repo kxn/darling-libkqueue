@@ -219,13 +219,17 @@ err_path:
         if (nevents > 0) {
             memcpy(eventlist, src, sizeof(*src));
             eventlist->data = status;
-            eventlist->flags = EV_ERROR;
+            eventlist->flags |= EV_ERROR;
             nevents--;
             eventlist++;
             nret++;
-        } else {
+        } else if (status != 0) {
+            /* No output slot can carry a real registration error. */
+            errno = status;
             return (-1);
         }
+        /* A successful EV_RECEIPT without an output slot is still success.
+         * Apply all remaining changes, as Darwin's kevent_register does. */
     }
 
     return (nret);
@@ -372,7 +376,9 @@ kevent64_impl(int kqfd, const struct kevent64_s *changelist, int nchanges,
             nevents -= rv;
             ret += rv;
 
-            // keep going to process more events (if we have room)
+            /* Darwin returns registration receipts/errors immediately;
+             * spare output capacity must not cause a wait for new events. */
+            goto out;
         }
     }
 

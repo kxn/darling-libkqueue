@@ -47,7 +47,12 @@ evfilt_machport_copyout(struct kevent64_s *dst, struct knote *src, void *ptr)
     kevent_int_to_64(&src->kev, dst);
 
 	// first, read the notification
-	rv = recv(src->kdata.kn_dupfd, &notification, sizeof(notification), 0);
+	rv = recv(src->kdata.kn_dupfd, &notification, sizeof(notification), MSG_DONTWAIT);
+    if (rv < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        /* An epoll result from a replaced channel can race with a change. */
+        dst->filter = EVFILT_DROP;
+        return 0;
+    }
 	if (rv < 0) {
 		dbg_printf("evfilt_machport_copyout() reading notification failed: %d (%s)", errno, strerror(errno));
 		return -1;
@@ -143,40 +148,35 @@ int
 evfilt_machport_knote_modify(struct filter *filt, struct knote *kn, 
         const struct kevent64_s *kev)
 {
-	dserver_kqchan_call_mach_port_modify_t call;
-	dserver_kqchan_reply_mach_port_modify_t reply = {0};
-	int rv;
-
-	call.header.number = dserver_kqchan_msgnum_mach_port_modify;
-	call.header.pid = getpid();
-	call.header.tid = THREAD_ID;
-	call.receive_buffer = kev->ext[0];
-	call.receive_buffer_size = kev->ext[1];
-	call.saved_filter_flags = kev->fflags;
-
-	rv = send(kn->kdata.kn_dupfd, &call, sizeof(call), 0);
-	if (rv < 0) {
-		dbg_printf("evfilt_machport_knote_modify send failed: %d (%s)", errno, strerror(errno));
-		return -1;
-	}
-
-	rv = recv(kn->kdata.kn_dupfd, &reply, sizeof(reply), 0);
-	if (rv < 0) {
-		dbg_printf("evfilt_machport_knote_modify recv failed: %d (%s)", errno, strerror(errno));
-		return -1;
-	}
-
-	if (reply.header.number != dserver_kqchan_msgnum_mach_port_modify) {
-		dbg_puts("evfilt_machport_knote_modify invalid reply");
-		return -1;
-	}
-
-	if (reply.header.code != 0) {
-		// FIXME: same as in copyout: Linux code but Darwin strerror
-		dbg_printf("evfilt_machport_knote_modify call failed: %d (%s)", -reply.header.code, strerror(-reply.header.code));
-		return -1;
-	}
-
+    /* The channel carries notifications and request replies on the same
+     * socket. A queued readiness packet can precede a modify reply, especially
+     * after MACH_RCV_TOO_LARGE. Replace the real subscription instead of
+     * mistaking that notification for an acknowledgement. The kqueue mutex
+     * serializes this operation with copyout; the Mach receive right and its
+     * queued messages stay owned by the caller throughout.
+     */
+    int replacement = -1;
+    int status = _dserver_rpc_kqchan_mach_port_open_4libkqueue((int)kev->ident,
+            (void*)kev->ext[0], kev->ext[1], kev->fflags, &replacement);
+    if (status < 0) { errno = -status; return -1; }
+    fcntl(replacement, F_SETFD, FD_CLOEXEC);
+    int enabled = !(kn->kev.flags & EV_DISABLE);
+    struct epoll_event event = {0};
+    event.events = kn->data.events;
+    event.data.ptr = kn;
+    if (enabled && epoll_ctl(kn->kn_epollfd, EPOLL_CTL_ADD, replacement, &event) < 0) {
+        int saved = errno;
+        __close_for_kqueue(replacement);
+        errno = saved;
+        return -1;
+    }
+    int previous = kn->kdata.kn_dupfd;
+    if (enabled) epoll_ctl(kn->kn_epollfd, EPOLL_CTL_DEL, previous, NULL);
+    kn->kdata.kn_dupfd = replacement;
+    kn->kev.fflags = kev->fflags;
+    kn->kev.ext[0] = kev->ext[0];
+    kn->kev.ext[1] = kev->ext[1];
+    __close_for_kqueue(previous);
     return 0;
 }
 

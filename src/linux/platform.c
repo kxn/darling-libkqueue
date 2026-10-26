@@ -1,3 +1,9 @@
+#ifdef DARLING
+#include <darling-config.h>
+#define KQUEUE_PROCFS_PATH DARLING_PROCFS_PATH
+#else
+#define KQUEUE_PROCFS_PATH "/proc"
+#endif
 /*
  * Copyright (c) 2011 Mark Heily <mark@heily.com>
  *
@@ -436,12 +442,27 @@ epoll_update(int op, struct filter *filt, struct knote *kn, struct epoll_event *
 int
 linux_fd_to_path(char *buf, size_t bufsz, int fd)
 {
+#ifdef DARLING
+    /* inotify_add_watch takes a Darwin path and expands it before entering
+     * Linux. A procfs readlink target is already a physical Linux path and
+     * would acquire the virtual root twice. Keep the procfs FD link itself;
+     * Linux follows it to the same inode, even after a rename or unlink. */
+    if (fcntl(fd, F_GETFD) < 0)
+        return (-1);
+    int length = snprintf(buf, bufsz, KQUEUE_PROCFS_PATH "/self/fd/%d", fd);
+    if (length < 0 || (size_t)length >= bufsz) {
+        errno = ENAMETOOLONG;
+        return (-1);
+    }
+    return (length);
+#else
     char path[1024];    //TODO: Maxpathlen, etc.
 
-    if (snprintf(&path[0], sizeof(path), "/proc/%d/fd/%d", getpid(), fd) < 0)
+    if (snprintf(&path[0], sizeof(path), KQUEUE_PROCFS_PATH "/%d/fd/%d", getpid(), fd) < 0)
         return (-1);
 
     memset(buf, 0, bufsz);
     return (readlink(path, buf, bufsz));
+#endif
 }
 
