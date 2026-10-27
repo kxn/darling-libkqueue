@@ -59,13 +59,21 @@ evfilt_proc_copyout(struct kevent64_s *dst, struct knote *src, void *ptr)
 	kevent_int_to_64(&src->kev, dst);
 
 	// first, read the notification
-	rv = recv(src->kdata.kn_dupfd, &notification, sizeof(notification), 0);
+	do {
+		rv = recv(src->kdata.kn_dupfd, &notification, sizeof(notification), MSG_DONTWAIT);
+	} while (rv < 0 && errno == EINTR);
+	if (rv < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+		/* epoll may retain readiness consumed by an earlier copyout/modify.
+		 * Never block the entire kqueue waiting for another process event. */
+		dst->filter = EVFILT_DROP;
+		return 0;
+	}
 	if (rv < 0) {
 		dbg_printf("evfilt_proc_copyout() reading notification failed: %d (%s)", errno, strerror(errno));
 		return -1;
 	}
 
-	if (notification.header.number != dserver_kqchan_msgnum_notification) {
+	if (rv != sizeof(notification) || notification.header.number != dserver_kqchan_msgnum_notification) {
 		dbg_puts("evfilt_proc_copyout() read invalid notification");
 		return -1;
 	}
@@ -216,13 +224,16 @@ evfilt_proc_knote_modify(struct filter *filt, struct knote *kn,
         const struct kevent64_s *kev)
 {
 	dserver_kqchan_call_proc_modify_t call;
-	dserver_kqchan_reply_proc_modify_t reply;
+	union {
+		dserver_kqchan_reply_proc_modify_t reply;
+		dserver_kqchan_call_notification_t notification;
+	} response;
 	int rv;
 
 	call.header.number = dserver_kqchan_msgnum_proc_modify;
 	call.header.pid = getpid();
 	call.header.tid = THREAD_ID;
-	call.flags = kn->data.events;
+	call.flags = kev->fflags;
 
 	rv = send(kn->kdata.kn_dupfd, &call, sizeof(call), 0);
 	if (rv < 0) {
@@ -230,23 +241,31 @@ evfilt_proc_knote_modify(struct filter *filt, struct knote *kn,
 		return -1;
 	}
 
-	rv = recv(kn->kdata.kn_dupfd, &reply, sizeof(reply), 0);
+	/* The server acknowledges only after all older notifications, and then
+	 * re-notifies any still queued process events. Preserve the subscription
+	 * and its NOTE_TRACK children rather than replacing its socket. */
+	do {
+		rv = recv(kn->kdata.kn_dupfd, &response, sizeof(response), 0);
+	} while ((rv < 0 && errno == EINTR) ||
+	         (rv == sizeof(response.notification) &&
+	          response.notification.header.number == dserver_kqchan_msgnum_notification));
 	if (rv < 0) {
 		dbg_printf("evfilt_proc_knote_modify recv failed: %d (%s)", errno, strerror(errno));
 		return -1;
 	}
 
-	if (reply.header.number != dserver_kqchan_msgnum_proc_modify) {
+	if (rv != sizeof(response.reply) || response.reply.header.number != dserver_kqchan_msgnum_proc_modify) {
 		dbg_puts("evfilt_proc_knote_modify invalid reply");
 		return -1;
 	}
 
-	if (reply.header.code != 0) {
+	if (response.reply.header.code != 0) {
 		// FIXME: same as in copyout: Linux code but Darwin strerror
-		dbg_printf("evfilt_proc_knote_modify call failed: %d (%s)", -reply.header.code, strerror(-reply.header.code));
+		dbg_printf("evfilt_proc_knote_modify call failed: %d (%s)", -response.reply.header.code, strerror(-response.reply.header.code));
 		return -1;
 	}
 
+	kn->kev.fflags = kev->fflags;
     return 0;
 }
 
