@@ -33,10 +33,26 @@ knote_init(void)
 static int
 knote_cmp(struct knote *a, struct knote *b)
 {
-    return memcmp(&a->kev.ident, &b->kev.ident, sizeof(a->kev.ident)); 
+    int order=memcmp(&a->kev.ident,&b->kev.ident,sizeof(a->kev.ident));
+    if(order)return order;
+    int specific_a=!!(a->kev.flags&EV_UDATA_SPECIFIC);
+    int specific_b=!!(b->kev.flags&EV_UDATA_SPECIFIC);
+    if(specific_a!=specific_b)return specific_a-specific_b;
+    return specific_a ? memcmp(&a->kev.udata,&b->kev.udata,sizeof(a->kev.udata)) : 0;
 }
 
 RB_GENERATE(knt, knote, kn_entries, knote_cmp)
+
+/* Keep traversal beside RB_GENERATE; other units do not declare the generated
+ * pointer-returning functions. The caller holds the kqueue lock. */
+void
+knote_delete_ident(struct filter *filt, uintptr_t ident)
+{
+    struct knote *kn, *next;
+    RB_FOREACH_SAFE(kn, knt, &filt->kf_knote, next) {
+        if (kn->kev.ident == ident) knote_delete(filt, kn);
+    }
+}
 
 struct knote *
 knote_new(void)
@@ -48,6 +64,7 @@ knote_new(void)
         return (NULL);
 
     res->kn_ref = 1;
+    res->kn_deletefd = -1;
 
     return (res);
 }
@@ -94,7 +111,7 @@ knote_delete(struct filter *filt, struct knote *kn)
      * Verify that the knote wasn't removed by another
      * thread before we acquired the knotelist lock.
      */
-    query.kev.ident = kn->kev.ident;
+    query.kev = kn->kev;
     pthread_rwlock_wrlock(&filt->kf_knote_mtx);
     tmp = RB_FIND(knt, &filt->kf_knote, &query);
     if (tmp == kn) {
@@ -102,6 +119,13 @@ knote_delete(struct filter *filt, struct knote *kn)
     }
     pthread_rwlock_unlock(&filt->kf_knote_mtx);
 
+#ifdef __linux__
+    if(kn->kn_deletefd>=0) {
+        epoll_ctl(filter_epfd(filt),EPOLL_CTL_DEL,kn->kn_deletefd,NULL);
+        __close_for_kqueue(kn->kn_deletefd);
+        kn->kn_deletefd=-1;
+    }
+#endif
     filt->kn_delete(filt, kn); //XXX-FIXME check return value
 
     kn->kn_flags |= KNFL_KNOTE_DELETED;
@@ -114,16 +138,25 @@ knote_delete(struct filter *filt, struct knote *kn)
 struct knote *
 knote_lookup(struct filter *filt, uintptr_t ident)
 {
-    struct knote query;
+    struct kevent64_s event={.ident=ident};
+    return knote_lookup_event(filt,&event);
+}
+
+struct knote *
+knote_lookup_event(struct filter *filt, const struct kevent64_s *event)
+{
+    struct knote query={0};
     struct knote *ent = NULL;
 
-    query.kev.ident = ident;
+    query.kev.ident = event->ident;
+    query.kev.flags = event->flags&EV_UDATA_SPECIFIC;
+    query.kev.udata = event->udata;
 
     pthread_rwlock_rdlock(&filt->kf_knote_mtx);
     ent = RB_FIND(knt, &filt->kf_knote, &query);
     pthread_rwlock_unlock(&filt->kf_knote_mtx);
 
-    dbg_printf("id=%" PRIuPTR " ent=%p", ident, ent);
+    dbg_printf("id=%" PRIuPTR " ent=%p", (uintptr_t)event->ident, ent);
 
     return (ent);
 }

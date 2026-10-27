@@ -83,6 +83,7 @@ struct eventfd {
 struct knote {
     struct kevent_internal_s     kev;
     int               kn_flags;       
+    int               kn_deletefd;    /* Linux terminal-event notification */
     union {
         /* OLD */
         int           pfd;       /* Used by timerfd */
@@ -198,6 +199,11 @@ int kevent_copyin_one(struct kqueue *kq, const struct kevent64_s *src);
  * knote internal API
  */
 struct knote * knote_lookup(struct filter *, uintptr_t);
+struct knote * knote_lookup_event(struct filter *, const struct kevent64_s *);
+void knote_delete_ident(struct filter *, uintptr_t);
+#ifdef __linux__
+int knote_schedule_delete(struct filter *, struct knote *);
+#endif
 //DEADWOOD: struct knote * knote_get_by_data(struct filter *filt, intptr_t);
 struct knote * knote_new(void);
 #define knote_retain(kn) atomic_inc(&kn->kn_ref)

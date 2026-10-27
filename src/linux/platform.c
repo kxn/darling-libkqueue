@@ -196,6 +196,25 @@ restart:
 }
 
 int
+knote_schedule_delete(struct filter *filt, struct knote *kn)
+{
+    if(kn->kn_deletefd>=0)return 0;
+    int fd=eventfd(0,EFD_NONBLOCK|EFD_CLOEXEC);
+    if(fd<0)return -1;
+    struct epoll_event ev={.events=EPOLLIN,.data.ptr=kn};
+    if(epoll_ctl(filter_epfd(filt),EPOLL_CTL_ADD,fd,&ev)<0) {
+        __close_for_kqueue(fd);return -1;
+    }
+    uint64_t one=1;
+    if(write(fd,&one,sizeof one)!=sizeof one) {
+        epoll_ctl(filter_epfd(filt),EPOLL_CTL_DEL,fd,NULL);
+        __close_for_kqueue(fd);return -1;
+    }
+    kn->kn_deletefd=fd;
+    return 0;
+}
+
+int
 linux_kevent_copyout(struct kqueue *kq, int nready,
         struct kevent64_s *eventlist, int nevents UNUSED)
 {
@@ -216,6 +235,18 @@ linux_kevent_copyout(struct kqueue *kq, int nready,
             continue;
         }
         filt = &kq->kq_filt[~(kn->kev.filter)];
+        if(kn->kn_deletefd>=0) {
+            uint64_t value;
+            ssize_t bytes;
+            do {bytes=read(kn->kn_deletefd,&value,sizeof value);}while(bytes<0&&errno==EINTR);
+            if(bytes<0&&(errno==EAGAIN||errno==EWOULDBLOCK)){--nret;continue;}
+            if(bytes!=sizeof value)return -1;
+            *event=(struct kevent64_s){.ident=kn->kev.ident,.filter=kn->kev.filter,
+                .flags=EV_DELETE|EV_ONESHOT|EV_DISPATCH2,.udata=kn->kev.udata};
+            ++eventlist;
+            knote_delete(filt,kn);
+            continue;
+        }
         rv = filt->kf_copyout(event, kn, ev);
         if (slowpath(rv < 0)) {
             dbg_puts("knote_copyout failed");

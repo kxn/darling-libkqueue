@@ -127,7 +127,7 @@ kevent_copyin_one(struct kqueue *kq, const struct kevent64_s *src)
 
     dbg_printf("src=%s", kevent_dump(src));
 
-    kn = knote_lookup(filt, src->ident);
+    kn = knote_lookup_event(filt, src);
     dbg_printf("knote_lookup: ident %d == %p", (int)src->ident, kn);
     if (kn == NULL) {
         if (src->flags & EV_ADD) {
@@ -170,10 +170,24 @@ kevent_copyin_one(struct kqueue *kq, const struct kevent64_s *src)
         }
     }
 
-    if ((src->flags & EV_DELETE) || ((kn->kn_flags & KNFL_DEFER_DELETE) && (src->flags & EV_ENABLE))) {
+    if (src->flags & EV_DELETE) {
+        if(!(src->flags&EV_ENABLE) && (kn->kev.flags&EV_DISPATCH2)==EV_DISPATCH2 &&
+                (kn->kev.flags&EV_DISABLE)) {
+            /* A worker may still hold the last delivered event's udata.
+             * Preserve its registration until re-enable acknowledges it. */
+            kn->kn_flags|=KNFL_DEFER_DELETE;
+            errno=EINPROGRESS;
+            return -1;
+        }
         rv = knote_delete(filt, kn);
         dbg_printf("knote_delete returned %d", rv);
-    } else if (src->flags & EV_ADD || src->flags == 0 || src->flags & EV_RECEIPT) {
+    } else if((kn->kn_flags&KNFL_DEFER_DELETE) && (src->flags&EV_ENABLE)) {
+#ifdef __linux__
+        rv=knote_schedule_delete(filt,kn);
+#else
+        errno=ENOTSUP;rv=-1;
+#endif
+    } else if ((src->flags&EV_ADD) || !(src->flags&(EV_ENABLE|EV_DISABLE))) {
         /* EV_ADD|EV_ENABLE is an update followed by an optional transition,
          * not just EPOLL_CTL_ADD on an already enabled descriptor. */
         int disabled = !!(kn->kev.flags & EV_DISABLE);

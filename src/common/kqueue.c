@@ -210,15 +210,6 @@ kqueue_closed_fd(int fd)
 	if (kqmap == NULL)
 		return;
 
-	struct kevent64_s ev[2];
-
-	ev[0].ident = fd;
-	ev[0].flags = EV_DELETE | EV_RECEIPT;
-	ev[0].filter = EVFILT_READ;
-	ev[1].ident = fd;
-	ev[1].flags = EV_DELETE | EV_RECEIPT;
-	ev[1].filter = EVFILT_WRITE;
-
 	// we know it's not a kqueue FD (since kqueue_close() takes care of those),
 	// but it could be a fd inside a kqueue. Since we're creating duplicates of all fd's,
 	// we now have to walk through all known kqueues and remove the fd from them.
@@ -245,9 +236,15 @@ kqueue_closed_fd(int fd)
 		struct kqueue* kq = context.kqs_to_check[i];
 
 		kqueue_lock(kq);
-		// we don't care whether these operations succeed or not
-		kevent_copyin_one(kq, &ev[0]);
-		kevent_copyin_one(kq, &ev[1]);
+		/* Closing the actual descriptor removes every udata-specific
+		 * registration for that descriptor, including vnode watches. Closing
+		 * some other descriptor for the same inode must not do this. */
+		int filters[]={EVFILT_READ,EVFILT_WRITE,EVFILT_VNODE};
+		for(unsigned j=0;j<sizeof(filters)/sizeof(filters[0]);j++) {
+			struct filter* filt;
+			if(filter_lookup(&filt,kq,filters[j])<0)continue;
+			knote_delete_ident(filt,(uintptr_t)fd);
+		}
 		kqueue_unlock(kq);
 	}
 
